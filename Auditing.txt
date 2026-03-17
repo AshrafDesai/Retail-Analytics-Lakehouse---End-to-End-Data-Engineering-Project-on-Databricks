@@ -1,0 +1,68 @@
+--pipeline_audit_log
+
+CREATE TABLE IF NOT EXISTS retail_catalog.retail_analytics.pipeline_audit_log (
+  log_id           BIGINT GENERATED ALWAYS AS IDENTITY,
+  run_id           STRING        NOT NULL,
+  pipeline_name    STRING        NOT NULL,
+  target_table     STRING        NOT NULL,
+  rows_written     BIGINT,
+  rows_rejected    BIGINT,
+  status           STRING,
+  error_message    STRING,
+  started_at       TIMESTAMP     NOT NULL,
+  completed_at     TIMESTAMP,
+  duration_seconds INT
+)
+USING DELTA
+COMMENT 'Operational audit log for all pipeline runs';
+
+
+--Insert an audit record after each notebook completes:
+
+INSERT INTO retail_catalog.retail_analytics.pipeline_audit_log
+  (run_id, pipeline_name, target_table, rows_written, rows_rejected,
+   status, started_at, completed_at, duration_seconds)
+
+SELECT
+  uuid(),
+  'bronze_ingestion',
+  'bronze_sales',
+  COUNT(*),
+  0,
+  'SUCCESS',
+  current_timestamp(),
+  current_timestamp(),
+  0
+FROM retail_catalog.retail_analytics.bronze_sales;
+
+
+--Incremental Load Support 
+
+MERGE INTO retail_catalog.retail_analytics.silver_sales AS target
+USING (
+  SELECT
+    TRY_CAST(sale_id     AS INT)                                       AS sale_id,
+    TRY_TO_TIMESTAMP(event_timestamp, 'dd-MM-yyyy HH:mm')              AS event_timestamp,
+    DATE(TRY_TO_TIMESTAMP(event_timestamp, 'dd-MM-yyyy HH:mm'))        AS sale_date,
+    YEAR(TRY_TO_TIMESTAMP(event_timestamp, 'dd-MM-yyyy HH:mm'))        AS sale_year,
+    TRY_CAST(customer_id AS INT)                                       AS customer_id,
+    TRY_CAST(product_id  AS INT)                                       AS product_id,
+    CASE
+      WHEN quantity RLIKE '^[0-9]+$' THEN TRY_CAST(quantity AS INT)
+      ELSE NULL
+    END                                                                AS quantity,
+    UPPER(TRIM(currency))                                              AS currency,
+    LOWER(TRIM(channel))                                               AS channel,
+    source_file,
+    TRY_TO_TIMESTAMP(ingestion_timestamp, 'dd-MM-yyyy HH:mm')          AS ingestion_timestamp
+  FROM retail_catalog.retail_analytics.bronze_sales
+  WHERE TRY_CAST(customer_id AS INT) IS NOT NULL
+    AND TRY_CAST(customer_id AS INT) > 0
+    AND TRY_CAST(product_id  AS INT) IS NOT NULL
+    AND TRY_CAST(product_id  AS INT) > 0
+) AS source
+ON target.sale_id = source.sale_id
+WHEN MATCHED AND target.event_timestamp != source.event_timestamp
+  THEN UPDATE SET *
+WHEN NOT MATCHED
+  THEN INSERT *;

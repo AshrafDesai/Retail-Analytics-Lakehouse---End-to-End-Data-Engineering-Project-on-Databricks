@@ -1,0 +1,83 @@
+
+CREATE OR REPLACE TEMP VIEW pipeline_start_bronze AS
+SELECT current_timestamp() AS started_at;
+
+--bronze_sales — ingest all 5 sales batch CSVs
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.bronze_sales
+USING DELTA
+COMMENT 'Bronze layer: raw sales events ingested from Volume CSV files'
+TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')
+AS
+SELECT
+  *,
+  'Volume:retail_data/sales.csv' AS _source_file,
+  current_timestamp()            AS _ingestion_timestamp,
+  'bronze_ingestion_v1'          AS _pipeline_version
+FROM read_files(
+  '/Volumes/retail_catalog/retail_analytics/retail_data/sales.csv',
+  format       => 'csv',
+  header       => true,
+  inferSchema  => false
+);
+
+--bronze_master — union customers + products into one master table
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.bronze_master
+USING DELTA
+COMMENT 'Bronze layer: raw master data — customers and products combined'
+TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')
+AS
+SELECT
+  'customers'                               AS _record_type,
+  customer_id                               AS id,
+  full_name                                 AS name,
+  email                                     AS email_or_category,
+  city                                      AS city_or_price,
+  signup_date                               AS extra_field,
+  NULL                                      AS extra_field2,
+  'Volume:retail_data/Master_customers.csv' AS _source_file,
+  current_timestamp()                       AS _ingestion_timestamp,
+  'bronze_ingestion_v1'                     AS _pipeline_version
+FROM read_files(
+  '/Volumes/retail_catalog/retail_analytics/retail_data/Master_customers.csv',
+  format      => 'csv',
+  header      => true,
+  inferSchema => false
+)
+
+UNION ALL
+
+SELECT
+  'products'                                AS _record_type,
+  product_id                                AS id,
+  product_name                              AS name,
+  category                                  AS email_or_category,
+  price                                     AS city_or_price,
+  NULL                                      AS extra_field,
+  NULL                                      AS extra_field2,
+  'Volume:retail_data/master_products.csv'  AS _source_file,
+  current_timestamp()                       AS _ingestion_timestamp,
+  'bronze_ingestion_v1'                     AS _pipeline_version
+FROM read_files(
+  '/Volumes/retail_catalog/retail_analytics/retail_data/master_products.csv',
+  format      => 'csv',
+  header      => true,
+  inferSchema => false
+);
+
+INSERT INTO retail_catalog.retail_analytics.pipeline_audit_log
+  (run_id, pipeline_name, target_table, rows_written, rows_rejected, status, started_at, completed_at, duration_seconds)
+SELECT
+  uuid(),
+  'retail_pipeline',
+  'bronze_master',
+  (SELECT COUNT(*) FROM retail_catalog.retail_analytics.bronze_master),
+  0,
+  'SUCCESS',
+  s.started_at,
+  current_timestamp(),
+  CAST(unix_timestamp(current_timestamp()) - unix_timestamp(s.started_at) AS INT)
+FROM pipeline_start_bronze s;
+
+
+  

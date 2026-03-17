@@ -1,0 +1,287 @@
+CREATE OR REPLACE TEMP VIEW pipeline_start_silver AS
+SELECT current_timestamp() AS started_at;
+
+--silver_customers
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.silver_customers
+USING DELTA
+COMMENT 'Silver: deduplicated and typed customer dimension'
+TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')
+AS
+WITH deduped AS (
+  SELECT *,
+    ROW_NUMBER() OVER (
+      PARTITION BY id
+      ORDER BY _ingestion_timestamp DESC
+    ) AS rn
+  FROM retail_catalog.retail_analytics.bronze_master
+  WHERE _record_type = 'customers'
+    AND id IS NOT NULL
+    AND TRIM(id) != ''
+),
+cleaned AS (
+  SELECT
+    CAST(id AS INT)                               AS customer_id,
+    TRIM(name)                                    AS full_name,
+    LOWER(TRIM(email_or_category))                AS email,
+    TRIM(city_or_price)                           AS city,
+    TRY_TO_TIMESTAMP(extra_field, 'dd-MM-yyyy')   AS signup_date,
+    _ingestion_timestamp
+  FROM deduped
+  WHERE rn = 1
+)
+SELECT * FROM cleaned;
+
+--silver_products
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.silver_products
+USING DELTA
+COMMENT 'Silver: cleaned and typed product dimension'
+TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')
+AS
+SELECT
+  CAST(id AS INT)                                         AS product_id,
+  TRIM(name)                                              AS product_name,
+  TRIM(email_or_category)                                 AS category,
+  CASE
+    WHEN city_or_price RLIKE '^[0-9]+(\.[0-9]+)?$'
+      THEN TRY_CAST(city_or_price AS DECIMAL(12,2))
+    ELSE NULL
+  END                                                     AS unit_price,
+  CASE
+    WHEN TRY_CAST(city_or_price AS DECIMAL(12,2)) IS NULL
+      THEN 'corrupted_price'
+    WHEN TRY_CAST(city_or_price AS DECIMAL(12,2)) = 0
+      THEN 'zero_price'
+    ELSE 'valid'
+  END                                                     AS price_flag,
+  _ingestion_timestamp
+FROM retail_catalog.retail_analytics.bronze_master
+WHERE _record_type = 'products'
+  AND id IS NOT NULL;
+
+
+--silver_sales
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.silver_sales
+USING DELTA
+COMMENT 'Silver: cleaned sales fact table'
+PARTITIONED BY (sale_year)
+TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')
+AS
+SELECT
+  TRY_CAST(sale_id     AS INT)                                       AS sale_id,
+  TRY_TO_TIMESTAMP(event_timestamp, 'dd-MM-yyyy HH:mm')              AS event_timestamp,
+  DATE(TRY_TO_TIMESTAMP(event_timestamp, 'dd-MM-yyyy HH:mm'))        AS sale_date,
+  YEAR(TRY_TO_TIMESTAMP(event_timestamp, 'dd-MM-yyyy HH:mm'))        AS sale_year,
+  TRY_CAST(customer_id AS INT)                                       AS customer_id,
+  TRY_CAST(product_id  AS INT)                                       AS product_id,
+  CASE
+    WHEN quantity RLIKE '^[0-9]+$' THEN TRY_CAST(quantity AS INT)
+    ELSE NULL
+  END                                                                AS quantity,
+  UPPER(TRIM(currency))                                              AS currency,
+  LOWER(TRIM(channel))                                               AS channel,
+  source_file,
+  TRY_TO_TIMESTAMP(ingestion_timestamp, 'dd-MM-yyyy HH:mm')          AS ingestion_timestamp
+FROM retail_catalog.retail_analytics.bronze_sales
+WHERE
+  sale_id        IS NOT NULL
+  AND TRY_CAST(customer_id AS INT) IS NOT NULL
+  AND TRY_CAST(customer_id AS INT) > 0
+  AND TRY_CAST(product_id  AS INT) IS NOT NULL
+  AND TRY_CAST(product_id  AS INT) > 0;
+
+
+--dim_date (Date Dimension)
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.dim_date
+USING DELTA
+COMMENT 'Date dimension: 2022-01-01 to 2024-12-31'
+AS
+WITH date_range AS (
+  SELECT EXPLODE(SEQUENCE(
+    DATE '2022-01-01',
+    DATE '2024-12-31',
+    INTERVAL 1 DAY
+  )) AS date
+)
+SELECT
+  date,
+  DAY(date)                                          AS day,
+  MONTH(date)                                        AS month,
+  DATE_FORMAT(date, 'MMMM')                          AS month_name,
+  QUARTER(date)                                      AS quarter,
+  YEAR(date)                                         AS year,
+  WEEKOFYEAR(date)                                   AS week_of_year,
+  CASE WHEN DAYOFWEEK(date) IN (1, 7) THEN TRUE
+       ELSE FALSE END                                AS is_weekend,
+  CAST(DATE_FORMAT(date, 'yyyyMMdd') AS INT)         AS date_key
+FROM date_range;
+
+
+
+--Data Quality Checks  + rejected rows
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.rejected_rows
+USING DELTA
+COMMENT 'Quarantine table: rows that failed data quality rules'
+AS
+ 
+SELECT
+  'silver_sales'     AS source_table,
+  CAST(sale_id AS STRING) AS record_id,
+  'NULL or invalid quantity' AS rejection_reason,
+  current_timestamp() AS rejected_at
+FROM retail_catalog.retail_analytics.silver_sales
+WHERE quantity IS NULL
+ 
+UNION ALL
+ 
+SELECT
+  'silver_products'  AS source_table,
+  CAST(product_id AS STRING) AS record_id,
+  CASE
+    WHEN price_flag = 'corrupted_price' THEN 'Non-numeric price value'
+    WHEN price_flag = 'zero_price'      THEN 'Price equals zero'
+  END                AS rejection_reason,
+  current_timestamp() AS rejected_at
+FROM retail_catalog.retail_analytics.silver_products
+WHERE price_flag != 'valid'
+ 
+UNION ALL
+ 
+SELECT
+  'silver_customers' AS source_table,
+  CAST(customer_id AS STRING) AS record_id,
+  'Invalid email format' AS rejection_reason,
+  current_timestamp() AS rejected_at
+FROM retail_catalog.retail_analytics.silver_customers
+WHERE email NOT RLIKE '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+ 
+UNION ALL
+ 
+SELECT
+  'silver_customers' AS source_table,
+  CAST(customer_id AS STRING) AS record_id,
+  'NULL signup_date' AS rejection_reason,
+  current_timestamp() AS rejected_at
+FROM retail_catalog.retail_analytics.silver_customers
+WHERE signup_date IS NULL;
+
+--Dimension & Fact Table Models
+
+--dim_customers
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.dim_customers
+USING DELTA
+COMMENT 'Customer dimension — surrogate key + SCD Type 1'
+AS
+SELECT
+  customer_id,
+  full_name,
+  email,
+  city,
+  signup_date,
+  DATEDIFF(CURRENT_DATE(), signup_date)  AS customer_tenure_days,
+  current_timestamp()                    AS dw_updated_at
+FROM retail_catalog.retail_analytics.silver_customers
+WHERE customer_id IS NOT NULL;
+
+
+--dim_products
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.dim_products
+USING DELTA
+COMMENT 'Product dimension'
+AS
+SELECT
+  product_id,
+  product_name,
+  category,
+  unit_price,
+  price_flag,
+  current_timestamp() AS dw_updated_at
+FROM retail_catalog.retail_analytics.silver_products
+WHERE product_id IS NOT NULL;
+
+
+--fact_sales — Star Schema Fact Table
+
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.fact_sales
+USING DELTA
+COMMENT 'Central fact table — sales enriched with all dimension attributes'
+PARTITIONED BY (sale_year)
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact'   = 'true'
+)
+AS
+SELECT
+  s.sale_id,
+  s.event_timestamp,
+  s.sale_date,
+  s.sale_year,
+  dd.date_key,
+  dd.month,
+  dd.month_name,
+  dd.quarter,
+  dd.week_of_year,
+  dd.is_weekend,
+  s.customer_id,
+  c.full_name                          AS customer_name,
+  c.city,
+  c.signup_date                        AS customer_signup_date,
+  s.product_id,
+  p.product_name,
+  p.category,
+  p.unit_price,
+  s.quantity,
+  ROUND(s.quantity * p.unit_price, 2)  AS line_revenue,
+  s.currency,
+  s.channel
+FROM retail_catalog.retail_analytics.silver_sales            s
+INNER JOIN retail_catalog.retail_analytics.dim_customers     c  ON s.customer_id = c.customer_id
+INNER JOIN retail_catalog.retail_analytics.dim_products      p  ON s.product_id  = p.product_id
+LEFT  JOIN retail_catalog.retail_analytics.dim_date          dd ON s.sale_date    = dd.date;
+
+INSERT INTO retail_catalog.retail_analytics.pipeline_audit_log
+  (run_id, pipeline_name, target_table, rows_written, rows_rejected, status, started_at, completed_at, duration_seconds)
+SELECT
+  uuid(), 'retail_pipeline', 'silver_sales',
+  (SELECT COUNT(*) FROM retail_catalog.retail_analytics.silver_sales),
+  (SELECT COUNT(*) FROM retail_catalog.retail_analytics.rejected_rows),
+  'SUCCESS',
+  s.started_at, current_timestamp(),
+  CAST(unix_timestamp(current_timestamp()) - unix_timestamp(s.started_at) AS INT)
+FROM pipeline_start_silver s;
+
+INSERT INTO retail_catalog.retail_analytics.pipeline_audit_log
+  (run_id, pipeline_name, target_table, rows_written, rows_rejected, status, started_at, completed_at, duration_seconds)
+SELECT
+  uuid(), 'retail_pipeline', 'silver_customers',
+  (SELECT COUNT(*) FROM retail_catalog.retail_analytics.silver_customers),
+  0, 'SUCCESS',
+  s.started_at, current_timestamp(),
+  CAST(unix_timestamp(current_timestamp()) - unix_timestamp(s.started_at) AS INT)
+FROM pipeline_start_silver s;
+
+INSERT INTO retail_catalog.retail_analytics.pipeline_audit_log
+  (run_id, pipeline_name, target_table, rows_written, rows_rejected, status, started_at, completed_at, duration_seconds)
+SELECT
+  uuid(), 'retail_pipeline', 'silver_products',
+  (SELECT COUNT(*) FROM retail_catalog.retail_analytics.silver_products),
+  0, 'SUCCESS',
+  s.started_at, current_timestamp(),
+  CAST(unix_timestamp(current_timestamp()) - unix_timestamp(s.started_at) AS INT)
+FROM pipeline_start_silver s;
+
+INSERT INTO retail_catalog.retail_analytics.pipeline_audit_log
+  (run_id, pipeline_name, target_table, rows_written, rows_rejected, status, started_at, completed_at, duration_seconds)
+SELECT
+  uuid(), 'retail_pipeline', 'dim_date',
+  (SELECT COUNT(*) FROM retail_catalog.retail_analytics.dim_date),
+  0, 'SUCCESS',
+  s.started_at, current_timestamp(),
+  CAST(unix_timestamp(current_timestamp()) - unix_timestamp(s.started_at) AS INT)
+FROM pipeline_start_silver s;

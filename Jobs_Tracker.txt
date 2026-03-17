@@ -1,0 +1,24 @@
+SELECT * FROM retail_catalog.retail_analytics.pipeline_audit_log
+ORDER BY started_at DESC;
+
+SELECT * FROM retail_catalog.retail_analytics.pipeline_audit_log
+WHERE pipeline_name = 'retail_pipeline'
+ORDER BY started_at DESC
+LIMIT 20;
+
+CREATE OR REPLACE TEMP VIEW pipeline_start AS
+SELECT current_timestamp() AS started_at;
+
+INSERT INTO retail_catalog.retail_analytics.pipeline_audit_log
+  (run_id, pipeline_name, target_table, rows_written, rows_rejected, status, started_at, completed_at, duration_seconds)
+SELECT
+  uuid(),
+  'retail_pipeline',
+  'silver_sales',
+  (SELECT COUNT(*) FROM retail_catalog.retail_analytics.silver_sales),
+  (SELECT COUNT(*) FROM retail_catalog.retail_analytics.rejected_rows),
+  'SUCCESS',
+  s.started_at,
+  current_timestamp(),
+  CAST(unix_timestamp(current_timestamp()) - unix_timestamp(s.started_at) AS INT)
+FROM pipeline_start s;

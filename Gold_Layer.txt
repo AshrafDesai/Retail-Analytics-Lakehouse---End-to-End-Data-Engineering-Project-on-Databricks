@@ -1,0 +1,123 @@
+CREATE OR REPLACE TEMP VIEW pipeline_start_gold AS
+SELECT current_timestamp() AS started_at;
+
+--gold_daily_sales
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.gold_daily_sales
+USING DELTA
+COMMENT 'Gold: daily revenue and items sold — joins fact_sales with dim_date'
+AS
+SELECT
+  f.sale_date,
+  dd.date_key,
+  dd.month_name,
+  dd.quarter,
+  dd.year,
+  dd.is_weekend,
+  COUNT(DISTINCT f.sale_id)              AS total_transactions,
+  SUM(f.quantity)                        AS total_items_sold,
+  ROUND(SUM(f.line_revenue), 2)          AS total_revenue,
+  ROUND(AVG(f.line_revenue), 2)          AS avg_transaction_value
+FROM retail_catalog.retail_analytics.fact_sales              f
+INNER JOIN retail_catalog.retail_analytics.dim_date          dd ON f.sale_date = dd.date
+GROUP BY
+  f.sale_date, dd.date_key, dd.month_name, dd.quarter, dd.year, dd.is_weekend
+ORDER BY f.sale_date;
+
+--gold_customer_lifetime_value
+
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.gold_customer_lifetime_value
+USING DELTA
+COMMENT 'Gold: customer LTV — lifetime revenue, orders, and average order value'
+AS
+SELECT
+  f.customer_id,
+  f.customer_name                        AS full_name,
+  f.city,
+  COUNT(DISTINCT f.sale_id)              AS total_orders,
+  SUM(f.quantity)                        AS total_items_purchased,
+  ROUND(SUM(f.line_revenue), 2)          AS lifetime_revenue,
+  ROUND(SUM(f.line_revenue) /
+        NULLIF(COUNT(DISTINCT f.sale_id), 0), 2) AS avg_order_value,
+  MIN(f.sale_date)                       AS first_purchase_date,
+  MAX(f.sale_date)                       AS last_purchase_date,
+  DATEDIFF(MAX(f.sale_date),
+           MIN(f.sale_date))             AS customer_lifespan_days
+FROM retail_catalog.retail_analytics.fact_sales              f
+GROUP BY f.customer_id, f.customer_name, f.city
+ORDER BY lifetime_revenue DESC;
+
+--gold_category_performance
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.gold_category_performance
+USING DELTA
+COMMENT 'Gold: revenue and share per product category'
+AS
+WITH base AS (
+  SELECT
+    category,
+    SUM(quantity)                          AS items_sold,
+    ROUND(SUM(line_revenue), 2)            AS category_revenue
+  FROM retail_catalog.retail_analytics.fact_sales
+  WHERE unit_price IS NOT NULL
+  GROUP BY category
+),
+totals AS (
+  SELECT SUM(category_revenue) AS grand_total FROM base
+)
+SELECT
+  b.category,
+  b.items_sold,
+  b.category_revenue,
+  ROUND(b.category_revenue / t.grand_total * 100, 2) AS category_share_pct
+FROM base b
+CROSS JOIN totals t
+ORDER BY b.category_revenue DESC;
+
+
+
+
+
+INSERT INTO retail_catalog.retail_analytics.pipeline_audit_log
+  (run_id, pipeline_name, target_table, rows_written, rows_rejected, status, started_at, completed_at, duration_seconds)
+SELECT
+  uuid(),
+  'retail_pipeline',
+  'gold_daily_sales',
+  (SELECT COUNT(*) FROM retail_catalog.retail_analytics.gold_daily_sales),
+  0,
+  'SUCCESS',
+  current_timestamp(),
+  current_timestamp(),
+  0;
+
+INSERT INTO retail_catalog.retail_analytics.pipeline_audit_log
+  (run_id, pipeline_name, target_table, rows_written, rows_rejected, status, started_at, completed_at, duration_seconds)
+SELECT
+  uuid(), 'retail_pipeline', 'gold_customer_lifetime_value',
+  (SELECT COUNT(*) FROM retail_catalog.retail_analytics.gold_customer_lifetime_value),
+  0, 'SUCCESS',
+  s.started_at, current_timestamp(),
+  CAST(unix_timestamp(current_timestamp()) - unix_timestamp(s.started_at) AS INT)
+FROM pipeline_start_gold s;
+
+INSERT INTO retail_catalog.retail_analytics.pipeline_audit_log
+  (run_id, pipeline_name, target_table, rows_written, rows_rejected, status, started_at, completed_at, duration_seconds)
+SELECT
+  uuid(), 'retail_pipeline', 'gold_category_performance',
+  (SELECT COUNT(*) FROM retail_catalog.retail_analytics.gold_category_performance),
+  0, 'SUCCESS',
+  s.started_at, current_timestamp(),
+  CAST(unix_timestamp(current_timestamp()) - unix_timestamp(s.started_at) AS INT)
+FROM pipeline_start_gold s;
+
+INSERT INTO retail_catalog.retail_analytics.pipeline_audit_log
+  (run_id, pipeline_name, target_table, rows_written, rows_rejected, status, started_at, completed_at, duration_seconds)
+SELECT
+  uuid(), 'retail_pipeline', 'gold_repeat_customer_rate',
+  (SELECT COUNT(*) FROM retail_catalog.retail_analytics.gold_repeat_customer_rate),
+  0, 'SUCCESS',
+  s.started_at, current_timestamp(),
+  CAST(unix_timestamp(current_timestamp()) - unix_timestamp(s.started_at) AS INT)
+FROM pipeline_start_gold s;

@@ -1,0 +1,13 @@
+-- ═══ STEP 0.2: CREATE CATALOG & SCHEMA ═══
+CREATE CATALOG IF NOT EXISTS retail_catalog
+  COMMENT 'Enterprise Retail Analytics Platform';
+
+USE CATALOG retail_catalog;
+
+CREATE SCHEMA IF NOT EXISTS retail_analytics
+  COMMENT 'Main schema for all retail pipeline tables';
+
+USE SCHEMA retail_analytics;
+
+-- Verify
+SHOW SCHEMAS IN retail_catalog;

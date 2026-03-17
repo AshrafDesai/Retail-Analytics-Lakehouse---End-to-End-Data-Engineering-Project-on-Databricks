@@ -1,0 +1,100 @@
+--OPTIMIZE + ZORDER on fact_sales
+
+OPTIMIZE retail_catalog.retail_analytics.fact_sales
+  ZORDER BY (sale_date, customer_id, product_id);
+ 
+OPTIMIZE retail_catalog.retail_analytics.gold_daily_sales
+  ZORDER BY (sale_date);
+ 
+OPTIMIZE retail_catalog.retail_analytics.gold_customer_lifetime_value
+  ZORDER BY (customer_id);
+
+  --VACUUM — Remove Stale Delta Files
+
+VACUUM retail_catalog.retail_analytics.fact_sales          RETAIN 168 HOURS;
+VACUUM retail_catalog.retail_analytics.silver_sales        RETAIN 168 HOURS;
+VACUUM retail_catalog.retail_analytics.silver_customers    RETAIN 168 HOURS;
+VACUUM retail_catalog.retail_analytics.silver_products     RETAIN 168 HOURS;
+VACUUM retail_catalog.retail_analytics.gold_daily_sales    RETAIN 168 HOURS;
+
+
+--Table Statistics — Help the Query Optimizer
+
+ANALYZE TABLE retail_catalog.retail_analytics.fact_sales
+  COMPUTE STATISTICS FOR ALL COLUMNS;
+ 
+ANALYZE TABLE retail_catalog.retail_analytics.silver_sales
+  COMPUTE STATISTICS FOR ALL COLUMNS;
+
+--Partioning
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.gold_daily_sales
+USING DELTA
+PARTITIONED BY (year)
+TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')
+AS
+SELECT
+  f.sale_date,
+  dd.date_key,
+  dd.month_name,
+  dd.quarter,
+  dd.year,
+  dd.is_weekend,
+  COUNT(DISTINCT f.sale_id)     AS total_transactions,
+  SUM(f.quantity)               AS total_items_sold,
+  ROUND(SUM(f.line_revenue), 2) AS total_revenue,
+  ROUND(AVG(f.line_revenue), 2) AS avg_transaction_value
+FROM retail_catalog.retail_analytics.fact_sales         f
+INNER JOIN retail_catalog.retail_analytics.dim_date     dd ON f.sale_date = dd.date
+GROUP BY f.sale_date, dd.date_key, dd.month_name, dd.quarter, dd.year, dd.is_weekend
+ORDER BY f.sale_date;
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.gold_customer_lifetime_value
+USING DELTA
+PARTITIONED BY (city)
+TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')
+AS
+SELECT
+  f.customer_id,
+  f.customer_name                                                    AS full_name,
+  f.city,
+  COUNT(DISTINCT f.sale_id)                                         AS total_orders,
+  SUM(f.quantity)                                                    AS total_items_purchased,
+  ROUND(SUM(f.line_revenue), 2)                                     AS lifetime_revenue,
+  ROUND(SUM(f.line_revenue) / NULLIF(COUNT(DISTINCT f.sale_id), 0), 2) AS avg_order_value,
+  MIN(f.sale_date)                                                   AS first_purchase_date,
+  MAX(f.sale_date)                                                   AS last_purchase_date,
+  DATEDIFF(MAX(f.sale_date), MIN(f.sale_date))                      AS customer_lifespan_days
+FROM retail_catalog.retail_analytics.fact_sales f
+GROUP BY f.customer_id, f.customer_name, f.city
+ORDER BY lifetime_revenue DESC;
+
+
+CREATE OR REPLACE TABLE retail_catalog.retail_analytics.gold_category_performance
+USING DELTA
+PARTITIONED BY (category)
+TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')
+AS
+WITH base AS (
+  SELECT
+    category,
+    SUM(quantity)               AS items_sold,
+    ROUND(SUM(line_revenue), 2) AS category_revenue
+  FROM retail_catalog.retail_analytics.fact_sales
+  WHERE unit_price IS NOT NULL
+  GROUP BY category
+),
+totals AS (
+  SELECT SUM(category_revenue) AS grand_total FROM base
+)
+SELECT
+  b.category,
+  b.items_sold,
+  b.category_revenue,
+  ROUND(b.category_revenue / t.grand_total * 100, 2) AS category_share_pct
+FROM base b
+CROSS JOIN totals t
+ORDER BY b.category_revenue DESC;
+
+
+
+select * from retail_catalog.retail_analytics.rejected_rows;

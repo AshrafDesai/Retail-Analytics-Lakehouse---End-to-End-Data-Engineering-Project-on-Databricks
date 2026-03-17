@@ -1,0 +1,19 @@
+CREATE OR REPLACE PROCEDURE retail_catalog.retail_analytics.sp_bronze_ingest(
+  p_source_path   STRING,
+  p_target_table  STRING,
+  p_record_type   STRING
+)
+LANGUAGE SQL
+SQL SECURITY INVOKER
+COMMENT 'Reusable bronze ingestion framework — reads any CSV from Volume into Delta'
+BEGIN
+  EXECUTE IMMEDIATE
+    'CREATE OR REPLACE TABLE ' || p_target_table ||
+    ' USING DELTA
+     TBLPROPERTIES (''delta.autoOptimize.optimizeWrite'' = ''true'')
+     AS
+     SELECT *, ''' || p_record_type || ''' AS _record_type,
+       ''' || p_source_path || ''' AS _source_file,
+       current_timestamp() AS _ingestion_timestamp
+     FROM read_files(''' || p_source_path || ''', format=>''csv'', header=>true, inferSchema=>false)';
+END;
