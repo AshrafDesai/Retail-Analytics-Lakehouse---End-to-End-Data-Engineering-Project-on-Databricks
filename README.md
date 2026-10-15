@@ -473,17 +473,4 @@ Upload all 3 CSV files to:
 
 ---
 
-## 👤 Author
 
-**Asharafraza Desai**
-Data Engineering Intern — Inorg Global
-Project Duration: 04-03-2026 to 17-03-2026
-
----
-
-## 🏢 Company
-
-**Inorg Global**
-Project Manager: Rajesh Kumar Gupta
-
----
